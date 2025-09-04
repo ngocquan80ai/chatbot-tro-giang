@@ -1,187 +1,122 @@
+# kb.py — bản chuẩn cho app gộp (không phụ thuộc common.py)
+from __future__ import annotations
 import os
 import io
-import pickle
+import json
+import numpy as np
+from typing import List, Tuple
 
-from pypdf import PdfReader       # Thư viện đọc PDF
-from docx import Document         # Thư viện đọc DOCX (Word)
-import numpy as np               # Thư viện tính toán (dùng để tính độ tương đồng cosine)
+from pypdf import PdfReader          # đọc PDF
+from docx import Document            # đọc DOCX
 
-from common import create_embedding  # Hàm tạo embedding từ module common
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
 
-def read_document(file, file_name):
+def slugify_name(name: str) -> str:
+    import re
+    name = (name or "").strip()
+    # giữ chữ cái (kể cả có dấu), số, _ và -
+    out = []
+    for ch in name:
+        if ch.isalnum() or ch in "_-":
+            out.append(ch)
+        elif ch.isspace():
+            out.append("_")
+        else:
+            out.append("_")
+    s = "".join(out)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s or "untitled"
+
+def read_document(uploaded_file) -> str:
     """
-    Đọc nội dung văn bản từ tệp tải lên (PDF, DOCX hoặc TXT).
-    - file: đối tượng tệp (mở ở chế độ nhị phân hoặc file-like object, ví dụ UploadedFile của Streamlit).
-    - file_name: tên tệp (dùng để nhận diện định dạng dựa trên đuôi file).
-    - Trả về: Nội dung văn bản (chuỗi) nếu đọc thành công, hoặc chuỗi rỗng nếu có lỗi.
+    Đọc nội dung từ UploadedFile (.pdf/.docx/.txt) và trả về chuỗi.
+    Trả về chuỗi 'Lỗi …' nếu có lỗi để UI hiển thị rõ.
     """
-    # Xác định định dạng tệp dựa vào phần mở rộng của tên file
-    ext = os.path.splitext(file_name)[1].lower()  # Lấy đuôi file, chuyển về chữ thường
-    text = ""
     try:
+        fname = getattr(uploaded_file, "name", "").lower()
+        ext = os.path.splitext(fname)[1]
         if ext == ".pdf":
-            # Đọc file PDF
-            reader = PdfReader(file)  # file có thể là một file-like object
+            data = uploaded_file.read()
+            reader = PdfReader(io.BytesIO(data))
+            text = []
             for page in reader.pages:
-                # extract_text() trả về nội dung text của trang, thêm newline giữa các trang cho rõ ràng
-                text += (page.extract_text() or "") + "\n"
+                text.append(page.extract_text() or "")
+            return "\n".join(text).strip()
         elif ext == ".docx":
-            # Đọc file DOCX
-            # Nếu file là bytes, cần dùng BytesIO để Document có thể đọc
-            if isinstance(file, (bytes, bytearray)):
-                doc = Document(io.BytesIO(file))
-            else:
-                doc = Document(file)
-            # Ghép nội dung tất cả các đoạn (paragraph) lại, ngăn cách bằng newline
-            paragraphs = [p.text for p in doc.paragraphs]
-            text = "\n".join(paragraphs)
+            # python-docx nhận file-like; nếu không được thì chuyển sang BytesIO
+            try:
+                doc = Document(uploaded_file)
+            except Exception:
+                uploaded_file.seek(0)
+                doc = Document(io.BytesIO(uploaded_file.read()))
+            return "\n".join(p.text for p in doc.paragraphs).strip()
         elif ext == ".txt":
-            # Đọc file văn bản thuần
-            content = file.read()
-            if isinstance(content, bytes):
-                # Giải mã bytes sang chuỗi (UTF-8)
-                text = content.decode('utf-8', errors='ignore')
-            else:
-                # Nếu đã là chuỗi (trường hợp file mở sẵn dạng text)
-                text = str(content)
+            b = uploaded_file.read()
+            return (b.decode("utf-8", errors="ignore")).strip()
         else:
-            # Định dạng không hỗ trợ
-            return ""
+            return "Lỗi: Định dạng không hỗ trợ. Hãy dùng PDF/DOCX/TXT."
     except Exception as e:
-        # In lỗi và trả về chuỗi rỗng nếu đọc không thành công
-        print(f"Lỗi khi đọc file {file_name}:", e)
-        return ""
-    # Làm sạch nội dung: loại bỏ kí tự thừa nếu cần
-    text = text.strip()
-    return text
+        return f"Lỗi khi đọc tài liệu: {e}"
 
-def chunk_text(text, max_length=1000):
+def split_into_chunks(text: str, max_words: int = 100) -> List[str]:
     """
-    Chia văn bản dài thành các đoạn ngắn (chunk) để dễ tạo vector và lưu trữ.
-    - text: chuỗi văn bản đầu vào.
-    - max_length: độ dài tối đa (tính theo số ký tự) cho mỗi đoạn.
-    - Trả về: danh sách các đoạn văn bản (chuỗi), mỗi đoạn có độ dài tối đa max_length.
+    Chia văn bản thành các đoạn ~max_words từ (để tìm kiếm và prompt hiệu quả).
     """
-    # Loại bỏ các khoảng trắng thừa ở đầu/cuối và ký tự xuống dòng kép
-    text = text.replace("\r\n", "\n").strip()
-    # Tách văn bản thành các từ
-    words = text.split()
-    chunks = []
-    current_chunk = []
-    current_length = 0
-    for word in words:
-        # Thêm +1 cho khoảng trắng khi thêm từ mới (giữa các từ)
-        if current_length + len(word) + 1 <= max_length:
-            current_chunk.append(word)
-            current_length += len(word) + 1
-        else:
-            # Khi sắp thêm từ vượt quá giới hạn, bắt đầu một chunk mới
-            chunks.append(" ".join(current_chunk))
-            current_chunk = [word]
-            current_length = len(word)
-    # Thêm chunk cuối cùng còn sót lại
-    if current_chunk:
-        chunks.append(" ".join(current_chunk))
-    return chunks
-
-def _category_to_filename(category):
-    """
-    Chuyển tên lớp/chủ đề thành tên tệp tin lưu trữ an toàn.
-    """
-    # Loại bỏ khoảng trắng ở đầu cuối và thay khoảng trắng bằng dấu gạch dưới
-    safe_name = category.strip().replace(" ", "_")
-    # Thay thế một số ký tự đặc biệt có thể gây lỗi trong tên file
-    for ch in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
-        safe_name = safe_name.replace(ch, '_')
-    filename = f"knowledge_{safe_name}.pkl"
-    return filename
-
-def save_vectors(category, texts, vectors):
-    """
-    Lưu danh sách các vector và đoạn văn bản tương ứng vào tệp theo lớp/chủ đề.
-    - category: tên lớp hoặc chủ đề (chuỗi) để phân loại kiến thức.
-    - texts: danh sách các đoạn văn bản (chuỗi) đã chia nhỏ từ tài liệu.
-    - vectors: danh sách các vector embedding tương ứng với mỗi đoạn trong texts.
-    """
-    # Xác định tên file để lưu (theo category)
-    filename = _category_to_filename(category)
-    data = []
-    # Nếu file đã tồn tại, đọc dữ liệu cũ để nối thêm (tránh mất dữ liệu cũ)
-    if os.path.exists(filename):
-        try:
-            with open(filename, "rb") as f:
-                data = pickle.load(f)
-        except Exception as e:
-            print("Không thể tải dữ liệu cũ từ", filename, ":", e)
-            data = []
-    # Ghép cặp vector với đoạn text rồi thêm vào data
-    for vec, txt in zip(vectors, texts):
-        data.append((vec, txt))
-    # Lưu dữ liệu (danh sách các tuple (vector, đoạn văn)) vào file bằng pickle
-    with open(filename, "wb") as f:
-        pickle.dump(data, f)
-
-def load_vectors(category):
-    """
-    Tải danh sách các vector và đoạn văn bản đã lưu cho một lớp/chủ đề.
-    - category: tên lớp/chủ đề cần tải.
-    - Trả về: danh sách các tuple (vector, đoạn văn) nếu có, hoặc [] nếu không có dữ liệu.
-    """
-    filename = _category_to_filename(category)
-    if not os.path.exists(filename):
-        return []  # Chưa có file lưu cho chủ đề này
-    try:
-        with open(filename, "rb") as f:
-            data = pickle.load(f)
-            return data  # data là list các (vector, text)
-    except Exception as e:
-        print("Lỗi khi tải dữ liệu từ", filename, ":", e)
+    import re
+    if not text or not text.strip():
         return []
+    text = text.replace("\r", " ").replace("\n", " ")
+    sentences = re.split(r'(?<=[\.!?])\s+', text)
+    chunks, cur, cur_len = [], [], 0
+    for sent in sentences:
+        words = sent.split()
+        while len(words) > max_words:          # câu quá dài thì cắt nhỏ
+            chunks.append(" ".join(words[:max_words]))
+            words = words[max_words:]
+        if not words:
+            continue
+        if cur_len + len(words) <= max_words:
+            cur.extend(words)
+            cur_len += len(words)
+        else:
+            chunks.append(" ".join(cur))
+            cur, cur_len = words, len(words)
+    if cur:
+        chunks.append(" ".join(cur))
+    return [c.strip() for c in chunks if c.strip()]
 
-def list_categories():
-    """
-    Liệt kê danh sách tất cả các lớp/chủ đề đã có dữ liệu lưu trữ.
-    Dựa trên các tệp knowledge_*.pkl trong thư mục hiện tại.
-    """
-    categories = []
-    for file in os.listdir("."):
-        if file.startswith("knowledge_") and file.endswith(".pkl"):
-            name = file[len("knowledge_"):-4]  # cắt bỏ tiền tố và phần mở rộng
-            if name:
-                # Đổi dấu gạch dưới thành khoảng trắng cho dễ đọc (nếu trước đó có thay thế)
-                category_name = name.replace("_", " ")
-                categories.append(category_name)
-    return categories
+def _base_paths(class_code: str, topic_slug: str) -> Tuple[str, str]:
+    cls = slugify_name(class_code)
+    t   = slugify_name(topic_slug)
+    base = f"{cls}_{t}"
+    return os.path.join(DATA_DIR, base + ".json"), os.path.join(DATA_DIR, base + ".npy")
 
-def search_question(question, category, top_k=3):
+def save_knowledge(class_code: str, topic_slug: str, chunks: List[str], embeddings: np.ndarray):
     """
-    Tìm kiếm các đoạn kiến thức phù hợp nhất cho câu hỏi trong một lớp/chủ đề.
-    - question: câu hỏi (chuỗi văn bản).
-    - category: lớp/chủ đề muốn tìm trong kho kiến thức.
-    - top_k: số lượng đoạn văn bản liên quan cao nhất muốn lấy ra.
-    - Trả về: danh sách tối đa top_k đoạn văn bản liên quan nhất đến câu hỏi.
+    Lưu chunks (JSON) và embeddings (NPY) theo mã lớp + slug chủ đề.
     """
-    # Tạo embedding cho câu hỏi
-    q_vector = create_embedding(question)
-    if q_vector == [] or q_vector is None:
-        return []  # Không tạo được vector cho câu hỏi (có thể lỗi API hoặc question rỗng)
-    # Tải dữ liệu kiến thức đã lưu cho chủ đề
-    data = load_vectors(category)  # data là list các (vector, text)
-    if not data:
-        return []  # Nếu chưa có kiến thức nào cho chủ đề này
-    # Tính độ tương đồng cosine giữa câu hỏi và từng đoạn kiến thức
-    q_vec = np.array(q_vector)
-    scores = []
-    for vec, text in data:
-        vec = np.array(vec)
-        # Tính cosine similarity: cos_sim = (q_vec . vec) / (||q_vec|| * ||vec||)
-        # Thêm một giá trị rất nhỏ 1e-8 vào mẫu số để tránh chia cho 0
-        cosine_score = np.dot(q_vec, vec) / ((np.linalg.norm(q_vec) * np.linalg.norm(vec)) + 1e-8)
-        scores.append(cosine_score)
-    # Lấy chỉ số của top_k điểm cao nhất
-    top_k = min(top_k, len(scores))
-    # Sắp xếp các chỉ số dựa theo điểm từ cao đến thấp
-    top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
-    # Lấy ra các đoạn văn bản tương ứng với các chỉ số trên
-    top_texts = [data[i][1] for i in top_indices]
-    return top_texts
+    os.makedirs(DATA_DIR, exist_ok=True)
+    text_fp, emb_fp = _base_paths(class_code, topic_slug)
+    try:
+        with open(text_fp, "w", encoding="utf-8") as f:
+            json.dump(chunks, f, ensure_ascii=False, indent=2)
+        np.save(emb_fp, embeddings)
+        return True
+    except Exception as e:
+        return f"Lỗi lưu tri thức: {e}"
+
+def load_knowledge(class_code: str, topic_slug: str) -> Tuple[List[str] | None, np.ndarray | None]:
+    """
+    Tải lại (chunks, embeddings) cho lớp + chủ đề. Không có thì trả (None, None).
+    """
+    text_fp, emb_fp = _base_paths(class_code, topic_slug)
+    if not (os.path.exists(text_fp) and os.path.exists(emb_fp)):
+        return None, None
+    try:
+        with open(text_fp, "r", encoding="utf-8") as f:
+            chunks = json.load(f)
+        emb = np.load(emb_fp)
+        return chunks, emb
+    except Exception:
+        return None, None

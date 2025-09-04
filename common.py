@@ -1,99 +1,152 @@
+"""
+common.py
+- Không ném Exception khi import nếu thiếu API key (để app còn render UI).
+- Lấy GEMINI_API_KEY từ st.secrets (ưu tiên) hoặc biến môi trường.
+- Cung cấp 2 hàm:
+    embed_texts(texts: list[str]) -> np.ndarray
+    generate_answer(question: str, context: list[str] | str | None = None) -> str
+"""
+
+from __future__ import annotations
 import os
+import numpy as np
 
-# Đọc khóa API từ biến môi trường hoặc từ streamlit secrets (nếu chạy trên Streamlit)
-API_KEY = os.getenv("GEMINI_API_KEY")
+# Thử import streamlit để đọc secrets khi chạy trên Streamlit Cloud
 try:
-    import streamlit as st
-    # Nếu có sử dụng Streamlit, lấy API key từ file Secrets
-    if "GEMINI_API_KEY" in st.secrets:
-        API_KEY = st.secrets["GEMINI_API_KEY"]
-        # Đặt API key vào biến môi trường để SDK của Google có thể tự động sử dụng
-        os.environ["GEMINI_API_KEY"] = API_KEY
-except Exception as e:
-    # Không dùng streamlit hoặc không có secrets, sẽ dùng API_KEY từ env (nếu có)
-    pass
+    import streamlit as st  # type: ignore
+except Exception:
+    st = None
 
-# Kiểm tra API key, nếu chưa cấu hình thì báo lỗi để người dùng biết
-if not API_KEY:
-    raise Exception("Chưa cấu hình GEMINI_API_KEY. Vui lòng thêm API key vào Streamlit Secrets hoặc biến môi trường!")
+# SDK Gemini
+import google.generativeai as genai
 
-# Import SDK của Google Gemini
-from google import genai
+_CONFIGURED = False  # đã configure API hay chưa
 
-# Khởi tạo client cho API Gemini (sử dụng API key từ môi trường)
-client = genai.Client()
-
-# Định nghĩa tên các mô hình sử dụng
-EMBED_MODEL = "gemini-embedding-001"   # Mô hình dùng để tạo embedding (vector) cho văn bản
-GEN_MODEL = "gemini-2.5-flash"         # Mô hình dùng để sinh nội dung (trả lời câu hỏi)
-
-def create_embedding(content):
-    """
-    Tạo vector embedding cho văn bản hoặc danh sách văn bản.
-    - content: Chuỗi văn bản đầu vào hoặc danh sách các chuỗi.
-    - Trả về: Vector (danh sách số thực) cho chuỗi đầu vào, 
-              hoặc danh sách các vector nếu đầu vào là danh sách chuỗi.
-    """
-    try:
-        # Nếu content là chuỗi đơn, cho vào list để xử lý đồng bộ
-        if isinstance(content, str):
-            contents = [content]
-        else:
-            contents = list(content)  # chuyển sang list để chắc chắn có thể lặp
-        
-        # Gọi API Gemini để tạo embedding cho các nội dung trong danh sách
-        result = client.models.embed_content(model=EMBED_MODEL, contents=contents)
-        # Kết quả trả về chứa thuộc tính embeddings (danh sách các vector)
-        # Mỗi phần tử trong result.embeddings có thuộc tính values là list số float
-        vectors = [emb.values for emb in result.embeddings]
-        
-        # Nếu đầu vào chỉ một chuỗi, trả về vector (thay vì list chứa một phần tử)
-        if isinstance(content, str):
-            return vectors[0] if vectors else []
-        # Nếu đầu vào là list chuỗi, trả về danh sách vector tương ứng
-        return vectors
-    except Exception as e:
-        # In ra lỗi (nếu có) để tiện gỡ lỗi
-        print("Lỗi khi tạo embedding:", e)
+def _get_api_key() -> str | None:
+    """Ưu tiên lấy từ st.secrets, sau đó biến môi trường."""
+    if st is not None:
         try:
-            import streamlit as st
-            st.error("Lỗi: Không thể tạo embedding cho văn bản.")
-        except:
+            val = st.secrets.get("GEMINI_API_KEY")  # type: ignore[attr-defined]
+            if val:
+                return val
+        except Exception:
             pass
-        return []  # Trả về list rỗng nếu có lỗi
+    return os.getenv("GEMINI_API_KEY")
 
-def generate_answer(question, context=None):
-    """
-    Sinh câu trả lời cho câu hỏi dựa trên kiến thức (context) cho trước bằng mô hình Gemini.
-    - question: Câu hỏi đầu vào (chuỗi văn bản).
-    - context: Nội dung tri thức tham khảo (chuỗi hoặc danh sách các đoạn văn bản). Có thể là None nếu không có.
-    - Trả về: Câu trả lời (chuỗi văn bản).
-    """
-    try:
-        # Chuẩn bị prompt cho mô hình
-        if context:
-            # Nếu có context, ghép context vào prompt để mô hình sử dụng làm tư liệu
-            # Nếu context là danh sách các đoạn, kết hợp thành một khối văn bản
-            context_text = "\n".join(context) if isinstance(context, list) else str(context)
-            prompt = (f"Tài liệu tham khảo:\n{context_text}\n\n"
-                      f"Câu hỏi: {question}\n"
-                      "Hãy dựa vào tài liệu trên để trả lời bằng tiếng Việt thật chi tiết và dễ hiểu.")
+def _ensure_config() -> bool:
+    """Configure SDK đúng 1 lần. Trả về True nếu đã có key, False nếu thiếu."""
+    global _CONFIGURED
+    if _CONFIGURED:
+        return True
+    api_key = _get_api_key()
+    if not api_key:
+        # KHÔNG raise ở đây: để app vẫn lên giao diện.
+        if st is not None:
+            st.warning("⚠️ Chưa thiết lập GEMINI_API_KEY (Settings → Secrets). Một số chức năng sẽ không hoạt động.")
         else:
-            # Nếu không có context, chỉ đưa câu hỏi và yêu cầu trả lời
-            prompt = (f"Câu hỏi: {question}\n"
-                      "Trả lời bằng kiến thức của bạn bằng tiếng Việt một cách chi tiết và dễ hiểu.")
-        
-        # Gọi API Gemini để sinh nội dung trả lời
-        response = client.models.generate_content(model=GEN_MODEL, contents=prompt)
-        answer = response.text  # kết quả trả lời từ mô hình (chuỗi văn bản)
-        return answer
-    except Exception as e:
-        # Xử lý ngoại lệ nếu gọi API thất bại
-        print("Lỗi khi gọi API Gemini:", e)
+            print("[warn] GEMINI_API_KEY missing")
+        return False
+    genai.configure(api_key=api_key)
+    _CONFIGURED = True
+    return True
+
+# ========= EMBEDDINGS =========
+def embed_texts(texts: list[str]) -> np.ndarray:
+    """
+    Tạo embedding cho danh sách chuỗi. Trả về mảng (N, D).
+    Nếu thiếu API key → raise RuntimeError (tại thời điểm dùng).
+    """
+    if not texts:
+        return np.zeros((0, 0), dtype=np.float32)
+    if not _ensure_config():
+        raise RuntimeError("GEMINI_API_KEY chưa được thiết lập trong Secrets/ENV.")
+
+    vecs = []
+    for t in texts:
+        t = (t or "").strip()
+        if not t:
+            continue
+        # model embedding mới
+        resp = genai.embed_content(
+            model="models/text-embedding-004",
+            content=t,
+            task_type="retrieval_document",
+        )
+        # Chuẩn hóa lấy vector
+        emb = None
+        if isinstance(resp, dict):
+            emb = resp.get("embedding")
+            if isinstance(emb, dict):
+                emb = emb.get("values") or emb.get("value")
+            if emb is None and "embeddings" in resp:
+                try:
+                    emb = resp["embeddings"][0].get("values") or resp["embeddings"][0].get("value")
+                except Exception:
+                    emb = None
+        else:
+            try:
+                emb_obj = getattr(resp, "embedding", None)
+                emb = getattr(emb_obj, "values", None) or getattr(emb_obj, "value", None)
+            except Exception:
+                emb = None
+
+        if emb is None:
+            continue
+        vecs.append(np.array(emb, dtype=np.float32))
+
+    if not vecs:
+        return np.zeros((0, 0), dtype=np.float32)
+    return np.vstack(vecs)
+
+# ========= GENERATION =========
+def generate_answer(
+    question: str,
+    context: list[str] | str | None = None
+) -> str:
+    """
+    Gọi Gemini-1.5-Flash sinh trả lời. Nếu có context (1 hoặc nhiều đoạn), mô hình sẽ
+    được hướng dẫn chỉ bám vào context. Nếu thiếu API key → thông báo gọn.
+    """
+    if not _ensure_config():
+        return "⚠️ Ứng dụng chưa có GEMINI_API_KEY (Settings → Secrets)."
+
+    # Chuẩn bị prompt
+    if context:
+        ctx = "\n".join(context) if isinstance(context, list) else str(context)
+        system = (
+            "Bạn là Trợ giảng AI. Chỉ sử dụng thông tin trong 'Tài liệu tham khảo' để trả lời. "
+            "Nếu không đủ thông tin, hãy nói: 'Không có trong tài liệu'."
+        )
+        prompt = (
+            f"{system}\n\n"
+            f"Tài liệu tham khảo (trích đoạn):\n{ctx}\n\n"
+            f"Câu hỏi: {question}\n"
+            f"Hãy trả lời ngắn gọn, chính xác, bám sát tài liệu."
+        )
+    else:
+        prompt = f"Câu hỏi: {question}\nTrả lời ngắn gọn, chính xác bằng tiếng Việt."
+
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        resp = model.generate_content(prompt)
+        text = getattr(resp, "text", None)
+        if text and text.strip():
+            return text.strip()
+        # fallback khi SDK thay đổi cấu trúc
         try:
-            import streamlit as st
-            st.error("Đã xảy ra lỗi khi sinh câu trả lời từ mô hình Gemini.")
-        except:
+            parts = []
+            for c in resp.candidates:  # type: ignore[attr-defined]
+                for p in c.content.parts:
+                    if hasattr(p, "text"):
+                        parts.append(p.text)
+            if parts:
+                return "\n".join(parts).strip()
+        except Exception:
             pass
-        # Trả về câu xin lỗi người dùng
-        return "Xin lỗi, tôi không thể trả lời câu hỏi này vào lúc này."
+        return "Không có trong tài liệu."
+    except Exception as e:
+        if st is not None:
+            st.error(f"Lỗi gọi mô hình: {e}")
+        else:
+            print(f"[Generation error] {e}")
+        return "Đã xảy ra lỗi khi gọi mô hình."
